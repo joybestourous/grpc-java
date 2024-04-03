@@ -399,7 +399,7 @@ final class ProtocolNegotiators {
     return serverTls(sslContext, null);
   }
 
-  static final class ServerTlsHandler extends ChannelInboundHandlerAdapter {
+  static class ServerTlsHandler extends ChannelInboundHandlerAdapter {
     private Executor executor;
     private final ChannelHandler next;
     private final SslContext sslContext;
@@ -458,6 +458,31 @@ final class ProtocolNegotiators {
           .set(Grpc.TRANSPORT_ATTR_SSL_SESSION, session)
           .build();
       ctx.fireUserEventTriggered(pne.withAttributes(attrs).withSecurity(security));
+    }
+  }
+
+  /**
+   * Similar to {@link #serverTls(SslContext)}}, except that the created SslHandler
+   * sets startTls to true, enabling opportunistic encryption.
+   */
+  public static ProtocolNegotiator serverOpportunisticTls(final SslContext sslContext) {
+    return serverTls(sslContext, null);
+  }
+
+  static final class ServerOpportunisticTlsHandler extends ServerTlsHandler {
+    ServerOpportunisticTlsHandler(ChannelHandler next,
+        SslContext sslContext,
+        final ObjectPool<? extends Executor> executorPool) {
+      super(next, sslContext, executorPool);
+    }
+
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+      super.handlerAdded(ctx);
+      SSLEngine sslEngine = super.sslContext.newEngine(ctx.alloc());
+      ctx.pipeline().addBefore(ctx.name(), /* name= */ null, super.executor != null
+          ? new SslHandler(sslEngine, true, super.executor)
+          : new SslHandler(sslEngine, true));
     }
   }
 
