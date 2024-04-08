@@ -5,6 +5,7 @@ plugins {
     id "me.champeau.gradle.japicmp" apply false
     id "net.ltgt.errorprone" apply false
     id 'com.google.cloud.tools.jib' apply false
+    id 'maven-publish'
 }
 
 import io.grpc.gradle.CheckForUpdatesTask

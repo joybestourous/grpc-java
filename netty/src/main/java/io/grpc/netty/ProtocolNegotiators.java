@@ -419,10 +419,10 @@ final class ProtocolNegotiators {
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
       super.handlerAdded(ctx);
-      SSLEngine sslEngine = sslContext.newEngine(ctx.alloc());
-      ctx.pipeline().addBefore(ctx.name(), /* name= */ null, this.executor != null
-          ? new SslHandler(sslEngine, false, this.executor)
-          : new SslHandler(sslEngine, false));
+      SslHandler sslHandler =  this.executor != null
+          ? sslContext.newHandler(ctx.alloc(), this.executor)
+          : sslContext.newHandler(ctx.alloc());
+      ctx.pipeline().addBefore(ctx.name(), /* name= */ null, sslHandler);
     }
 
     @Override
@@ -461,12 +461,47 @@ final class ProtocolNegotiators {
     }
   }
 
+  public static ProtocolNegotiator serverOpportunisticTls(final SslContext sslContext) {
+    return serverOpportunisticTls(sslContext, null);
+  }
+
   /**
    * Similar to {@link #serverTls(SslContext)}}, except that the created SslHandler
    * sets startTls to true, enabling opportunistic encryption.
    */
-  public static ProtocolNegotiator serverOpportunisticTls(final SslContext sslContext) {
-    return serverTls(sslContext, null);
+  public static ProtocolNegotiator serverOpportunisticTls(final SslContext sslContext,
+      final ObjectPool<? extends Executor> executorPool) {
+    Preconditions.checkNotNull(sslContext, "sslContext");
+    final Executor executor;
+    if (executorPool != null) {
+      // The handlers here can out-live the {@link ProtocolNegotiator}.
+      // To keep their own reference to executor from executorPool, we use an extra (unused)
+      // reference here forces the executor to stay alive, which prevents it from being re-created
+      // for every connection.
+      executor = executorPool.getObject();
+    } else {
+      executor = null;
+    }
+    return new ProtocolNegotiator() {
+      @Override
+      public ChannelHandler newHandler(GrpcHttp2ConnectionHandler handler) {
+        ChannelHandler gnh = new GrpcNegotiationHandler(handler);
+        ChannelHandler sth = new ServerOpportunisticTlsHandler(gnh, sslContext, executorPool);
+        return new WaitUntilActiveHandler(sth, handler.getNegotiationLogger());
+      }
+
+      @Override
+      public void close() {
+        if (executorPool != null && executor != null) {
+          executorPool.returnObject(executor);
+        }
+      }
+
+      @Override
+      public AsciiString scheme() {
+        return Utils.HTTPS;
+      }
+    };
   }
 
   static final class ServerOpportunisticTlsHandler extends ServerTlsHandler {
