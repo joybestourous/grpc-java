@@ -353,18 +353,26 @@ public final class NettyServerBuilder extends ForwardingServerBuilder<NettyServe
    * have been configured with {@link GrpcSslContexts}, but options could have been overridden.
    */
   @CanIgnoreReturnValue
-  public NettyServerBuilder sslContext(SslContext sslContext) {
+  public NettyServerBuilder sslContext(SslContext sslContext, boolean oppTLS) {
     checkState(!freezeProtocolNegotiatorFactory,
                "Cannot change security when using ServerCredentials");
     if (sslContext != null) {
       checkArgument(sslContext.isServer(),
           "Client SSL context can not be used for server");
       GrpcSslContexts.ensureAlpnAndH2Enabled(sslContext.applicationProtocolNegotiator());
-      protocolNegotiatorFactory = ProtocolNegotiators.serverTlsFactory(sslContext);
+      if (oppTLS) {
+        protocolNegotiatorFactory = ProtocolNegotiators.serverOpportunisticTlsFactory(sslContext);
+      } else {
+        protocolNegotiatorFactory = ProtocolNegotiators.serverTlsFactory(sslContext);
+      }
     } else {
       protocolNegotiatorFactory = ProtocolNegotiators.serverPlaintextFactory();
     }
     return this;
+  }
+
+  public NettyServerBuilder sslContext(SslContext sslContext) {
+    return sslContext(sslContext, false);
   }
 
   /**

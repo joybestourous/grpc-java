@@ -68,6 +68,8 @@ public final class TlsServerCredentials extends ServerCredentials {
   private final byte[] rootCertificates;
   private final List<TrustManager> trustManagers;
 
+  private final boolean isOpportunistic;
+
   TlsServerCredentials(Builder builder) {
     fakeFeature = builder.fakeFeature;
     certificateChain = builder.certificateChain;
@@ -77,6 +79,7 @@ public final class TlsServerCredentials extends ServerCredentials {
     clientAuth = builder.clientAuth;
     rootCertificates = builder.rootCertificates;
     trustManagers = builder.trustManagers;
+    isOpportunistic = builder.opportunistic;
   }
 
   /**
@@ -144,6 +147,8 @@ public final class TlsServerCredentials extends ServerCredentials {
   public List<TrustManager> getTrustManagers() {
     return trustManagers;
   }
+
+  public boolean isOpportunistic() { return isOpportunistic; }
 
   /**
    * Returns an empty set if this credential can be adequately understood via
@@ -247,6 +252,8 @@ public final class TlsServerCredentials extends ServerCredentials {
     private ClientAuth clientAuth = ClientAuth.NONE;
     private byte[] rootCertificates;
     private List<TrustManager> trustManagers;
+
+    private boolean opportunistic = false;
 
     private Builder() {}
 
@@ -381,6 +388,11 @@ public final class TlsServerCredentials extends ServerCredentials {
           Arrays.asList(trustManagers)));
       clearTrustManagers();
       this.trustManagers = trustManagerList;
+      return this;
+    }
+
+    public Builder opportunistic(boolean isEnabled) {
+      this.opportunistic = isEnabled;
       return this;
     }
 

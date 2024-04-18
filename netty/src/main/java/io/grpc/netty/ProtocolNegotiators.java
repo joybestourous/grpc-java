@@ -60,6 +60,7 @@ import io.netty.handler.proxy.HttpProxyHandler;
 import io.netty.handler.proxy.ProxyConnectionEvent;
 import io.netty.handler.ssl.OpenSsl;
 import io.netty.handler.ssl.OpenSslEngine;
+import io.netty.handler.ssl.OptionalSslHandler;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslHandler;
@@ -245,6 +246,9 @@ final class ProtocolNegotiators {
         throw new IllegalArgumentException(
             "Unexpected error converting ServerCredentials to Netty SslContext", ex);
       }
+      if (((TlsServerCredentials) creds).isOpportunistic()) {
+        return FromServerCredentialsResult.negotiator(serverOpportunisticTlsFactory(sslContext));
+      }
       return FromServerCredentialsResult.negotiator(serverTlsFactory(sslContext));
 
     } else if (creds instanceof InsecureServerCredentials) {
@@ -335,20 +339,29 @@ final class ProtocolNegotiators {
   }
 
   public static ProtocolNegotiator.ServerFactory serverTlsFactory(SslContext sslContext) {
-    return new TlsProtocolNegotiatorServerFactory(sslContext);
+    return new TlsProtocolNegotiatorServerFactory(sslContext, false);
+  }
+
+  public static ProtocolNegotiator.ServerFactory serverOpportunisticTlsFactory(SslContext sslContext){
+    return new TlsProtocolNegotiatorServerFactory(sslContext, true);
   }
 
   @VisibleForTesting
   static final class TlsProtocolNegotiatorServerFactory
       implements ProtocolNegotiator.ServerFactory {
     private final SslContext sslContext;
+    private final boolean isOpportunistic;
 
-    public TlsProtocolNegotiatorServerFactory(SslContext sslContext) {
+    public TlsProtocolNegotiatorServerFactory(SslContext sslContext, boolean isOpportunistic) {
       this.sslContext = Preconditions.checkNotNull(sslContext, "sslContext");
+      this.isOpportunistic = isOpportunistic;
     }
 
     @Override
     public ProtocolNegotiator newNegotiator(ObjectPool<? extends Executor> offloadExecutorPool) {
+      if (isOpportunistic) {
+        return serverOpportunisticTls(sslContext, offloadExecutorPool);
+      }
       return serverTls(sslContext, offloadExecutorPool);
     }
   }
@@ -399,7 +412,7 @@ final class ProtocolNegotiators {
     return serverTls(sslContext, null);
   }
 
-  static class ServerTlsHandler extends ChannelInboundHandlerAdapter {
+  static final class ServerTlsHandler extends ChannelInboundHandlerAdapter {
     private Executor executor;
     private final ChannelHandler next;
     private final SslContext sslContext;
@@ -504,22 +517,72 @@ final class ProtocolNegotiators {
     };
   }
 
-  static final class ServerOpportunisticTlsHandler extends ServerTlsHandler {
+  static final class ServerOpportunisticTlsHandler extends ChannelInboundHandlerAdapter {
+    private Executor executor;
+    private final ChannelHandler next;
+    private final SslContext sslContext;
+
+    private ProtocolNegotiationEvent pne = ProtocolNegotiationEvent.DEFAULT;
+
     ServerOpportunisticTlsHandler(ChannelHandler next,
         SslContext sslContext,
         final ObjectPool<? extends Executor> executorPool) {
-      super(next, sslContext, executorPool);
+      this.sslContext = checkNotNull(sslContext, "sslContext");
+      this.next = checkNotNull(next, "next");
+      if (executorPool != null) {
+        this.executor = executorPool.getObject();
+      }
     }
 
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
       super.handlerAdded(ctx);
-      SSLEngine sslEngine = super.sslContext.newEngine(ctx.alloc());
-      ctx.pipeline().addBefore(ctx.name(), /* name= */ null, super.executor != null
-          ? new SslHandler(sslEngine, true, super.executor)
-          : new SslHandler(sslEngine, true));
+
+      ctx.pipeline()
+          .addBefore(
+              ctx.name(),
+              /* name= */ null,
+              this.executor != null
+                  ? new CustomOptionalSslHandler(sslContext, next, this.executor)
+                  : new CustomOptionalSslHandler(sslContext, next, null));
+    }
+
+    @Override
+    public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+      if (evt instanceof ProtocolNegotiationEvent) {
+        pne = (ProtocolNegotiationEvent) evt;
+      } else if (evt instanceof SslHandshakeCompletionEvent) {
+        SslHandshakeCompletionEvent handshakeEvent = (SslHandshakeCompletionEvent) evt;
+        if (!handshakeEvent.isSuccess()) {
+          logSslEngineDetails(Level.FINE, ctx, "TLS negotiation failed for new client.", null);
+          ctx.fireExceptionCaught(handshakeEvent.cause());
+          return;
+        }
+        SslHandler sslHandler = ctx.pipeline().get(SslHandler.class);
+        if (!sslContext.applicationProtocolNegotiator().protocols().contains(
+            sslHandler.applicationProtocol())) {
+          logSslEngineDetails(Level.FINE, ctx, "TLS negotiation failed for new client.", null);
+          ctx.fireExceptionCaught(unavailableException(
+              "Failed protocol negotiation: Unable to find compatible protocol"));
+          return;
+        }
+        ctx.pipeline().replace(ctx.name(), null, next);
+        fireProtocolNegotiationEvent(ctx, sslHandler.engine().getSession());
+      } else {
+        super.userEventTriggered(ctx, evt);
+      }
+    }
+
+    private void fireProtocolNegotiationEvent(ChannelHandlerContext ctx, SSLSession session) {
+      Security security = new Security(new Tls(session));
+      Attributes attrs = pne.getAttributes().toBuilder()
+          .set(GrpcAttributes.ATTR_SECURITY_LEVEL, SecurityLevel.PRIVACY_AND_INTEGRITY)
+          .set(Grpc.TRANSPORT_ATTR_SSL_SESSION, session)
+          .build();
+      ctx.fireUserEventTriggered(pne.withAttributes(attrs).withSecurity(security));
     }
   }
+
 
   /**
    * Returns a {@link ProtocolNegotiator} that does HTTP CONNECT proxy negotiation.
