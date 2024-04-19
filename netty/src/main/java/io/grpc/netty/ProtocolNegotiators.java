@@ -479,8 +479,9 @@ final class ProtocolNegotiators {
   }
 
   /**
-   * Similar to {@link #serverTls(SslContext)}}, except that the created SslHandler
-   * sets startTls to true, enabling opportunistic encryption.
+   * Similar to {@link #serverTls(SslContext)}}, except that it adds a {@link CustomOptionalSslHandler}
+   * instead of an {@link SslHandler}, allowing the server to accept both TLS and plaintext traffic
+   * depending on the first message.
    */
   public static ProtocolNegotiator serverOpportunisticTls(final SslContext sslContext,
       final ObjectPool<? extends Executor> executorPool) {

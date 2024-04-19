@@ -38,6 +38,18 @@ import java.util.List;
 /**
  * {@link CustomOptionalSslHandler} is a utility decoder to support both SSL and non-SSL handlers
  * based on the first message received.
+ *
+ * <p> This is equivalent to Netty's {@link io.netty.handler.ssl.OptionalSslHandler} with a few
+ * added features:
+ * <li> The {@link CustomOptionalSslHandler} constructor takes an {@link Executor} so it can be used
+ * to create a new SslHandler if dealing with Ssl traffic. This is more in line with how the
+ * SslHandler is created when created from
+ * {@link io.grpc.netty.ProtocolNegotiators.ServerTlsHandler#handlerAdded(ChannelHandlerContext)}
+ * <li> When dealing with plaintext traffic, it's not enough to remove only the
+ * {@link CustomOptionalSslHandler}. We need to also remove the
+ * {@link io.grpc.netty.ProtocolNegotiators.ServerOpportunisticTlsHandler} so that the channel pipeline
+ * behaves the same as the traditional plaintext pipeline, and we need to call
+ * {@link ChannelHandlerContext#fireUserEventTriggered(Object)} to continue along the pipeline
  */
 public class CustomOptionalSslHandler extends ByteToMessageDecoder {
 

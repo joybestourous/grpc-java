@@ -67,7 +67,6 @@ public final class TlsServerCredentials extends ServerCredentials {
   private final ClientAuth clientAuth;
   private final byte[] rootCertificates;
   private final List<TrustManager> trustManagers;
-
   private final boolean isOpportunistic;
 
   TlsServerCredentials(Builder builder) {
@@ -148,6 +147,8 @@ public final class TlsServerCredentials extends ServerCredentials {
     return trustManagers;
   }
 
+  /** Non-{@code null} setting indicating whether the server accept both plaintext and TLS traffic
+   * depending on the first message */
   public boolean isOpportunistic() { return isOpportunistic; }
 
   /**
