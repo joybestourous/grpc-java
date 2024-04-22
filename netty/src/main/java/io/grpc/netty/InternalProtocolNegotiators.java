@@ -87,36 +87,6 @@ public final class InternalProtocolNegotiators {
     return new ServerTlsNegotiator();
   }
 
-  /**
-   * Returns a {@link ProtocolNegotiator} that ensures the pipeline is set up so that TLS will be
-   * negotiated, the server TLS {@code handler} is added and writes to the {@link
-   * io.netty.channel.Channel} may happen immediately, even before the TLS Handshake is complete.
-   *
-   * <p> Note this can be removed in favor of {@link io.grpc.TlsServerCredentials#isOpportunistic()}
-   * we don't need both APIs
-   */
-  public static InternalProtocolNegotiator.ProtocolNegotiator serverOpportunisticTls(SslContext sslContext) {
-    final io.grpc.netty.ProtocolNegotiator negotiator = ProtocolNegotiators.serverOpportunisticTls(sslContext);
-    final class ServerTlsNegotiator implements InternalProtocolNegotiator.ProtocolNegotiator {
-      @Override
-      public AsciiString scheme() {
-        return negotiator.scheme();
-      }
-
-      @Override
-      public ChannelHandler newHandler(GrpcHttp2ConnectionHandler grpcHandler) {
-        return negotiator.newHandler(grpcHandler);
-      }
-
-      @Override
-      public void close() {
-        negotiator.close();
-      }
-    }
-
-    return new ServerTlsNegotiator();
-  }
-
   /** Returns a {@link ProtocolNegotiator} for plaintext client channel. */
   public static InternalProtocolNegotiator.ProtocolNegotiator plaintext() {
     final io.grpc.netty.ProtocolNegotiator negotiator = ProtocolNegotiators.plaintext();
