@@ -91,6 +91,9 @@ public final class InternalProtocolNegotiators {
    * Returns a {@link ProtocolNegotiator} that ensures the pipeline is set up so that TLS will be
    * negotiated, the server TLS {@code handler} is added and writes to the {@link
    * io.netty.channel.Channel} may happen immediately, even before the TLS Handshake is complete.
+   *
+   * <p> Note this can be removed in favor of {@link io.grpc.TlsServerCredentials#isOpportunistic()}
+   * we don't need both APIs
    */
   public static InternalProtocolNegotiator.ProtocolNegotiator serverOpportunisticTls(SslContext sslContext) {
     final io.grpc.netty.ProtocolNegotiator negotiator = ProtocolNegotiators.serverOpportunisticTls(sslContext);
