@@ -1,0 +1,169 @@
+name: Auto-Detect New Releases
+
+env:
+  GIT_AUTHOR_NAME: "auto-detect-releases[bot]"
+  GIT_AUTHOR_EMAIL: "auto-detect-releases[bot]@datadoghq.com"
+
+on:
+  schedule:
+    # Run weekly on Tuesdays at 8:00 UTC (after sync-dd-master PR is reviewed)
+    - cron: '0 8 * * 2'
+  workflow_dispatch: # Allow manual triggering
+
+permissions:
+  actions: write   # Required to trigger create-release-branch workflow
+  contents: read   # Required to checkout and read git history
+
+concurrency:
+  group: auto-detect-releases
+  cancel-in-progress: false
+
+jobs:
+  detect-releases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write # Needed to federate tokens.
+    outputs:
+      needs_version_branch: ${{ steps.detect_upstream.outputs.needs_version_branch }}
+      latest_upstream: ${{ steps.detect_upstream.outputs.latest_upstream }}
+
+    env:
+      RELEASE_WORKFLOW: create-release-branch.yml
+
+    steps:
+      # Setup
+      - uses: DataDog/dd-octo-sts-action@acaa02eee7e3bb0839e4272dacb37b8f3b58ba80 # v1.0.3
+        id: octo-sts
+        with:
+          scope: DataDog/grpc-java-private
+          policy: self.auto-detect-releases
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.octo-sts.outputs.token }}
+      - name: Configure Git
+        run: |
+          git config user.name "${GIT_AUTHOR_NAME}"
+          git config user.email "${GIT_AUTHOR_EMAIL}"
+
+      - name: Setup upstream remote
+        run: |
+          if ! git remote | grep -q "^upstream$"; then
+            git remote add upstream https://github.com/grpc/grpc-java.git
+          fi
+          git fetch upstream master
+          git fetch origin dd-master
+
+
+      # Check for latest version
+      - name: Detect latest upstream release
+        id: detect_upstream
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            // Get latest upstream release from grpc/grpc-java
+            const { data: latestRelease } = await github.rest.repos.getLatestRelease({
+              owner: 'grpc',
+              repo: 'grpc-java'
+            });
+
+            const latestUpstream = latestRelease.tag_name;
+
+            if (!latestUpstream) {
+              core.setFailed('Error: Could not detect latest upstream release');
+              return;
+            }
+
+            console.log(`Latest upstream release: ${latestUpstream}`);
+            core.setOutput('latest_upstream', latestUpstream);
+
+            // Check if we already have a version branch for this release
+            const { execSync } = require('child_process');
+
+            try {
+              const versionBranch = `${latestUpstream}-branch`;
+              const branchExists = execSync(
+                `git ls-remote --heads origin refs/heads/${versionBranch}`,
+                { encoding: 'utf-8' }
+              ).trim();
+
+              if (branchExists) {
+                console.log(`Version branch ${versionBranch} already exists`);
+                core.setOutput('needs_version_branch', 'false');
+              } else {
+                console.log(`Version branch ${versionBranch} does not exist - will create`);
+                core.setOutput('needs_version_branch', 'true');
+              }
+            } catch (error) {
+              core.setFailed(`Error checking for version branch: ${error.message}`);
+            }
+
+
+      # New version - create version branch
+      - name: Fetch upstream tag if needed
+        if: steps.detect_upstream.outputs.needs_version_branch == 'true'
+        run: |
+          UPSTREAM_TAG="${{ steps.detect_upstream.outputs.latest_upstream }}"
+          echo "Fetching upstream tag: $UPSTREAM_TAG"
+
+          # Verify the upstream tag exists
+          if ! git fetch upstream refs/tags/$UPSTREAM_TAG:refs/tags/$UPSTREAM_TAG 2>&1; then
+            echo "::error::Failed to fetch upstream tag $UPSTREAM_TAG from grpc/grpc-java"
+            exit 1
+          fi
+
+          echo "Successfully fetched upstream tag: $UPSTREAM_TAG"
+
+      - name: Create version branch for new upstream release
+        if: steps.detect_upstream.outputs.needs_version_branch == 'true'
+        id: create_version_branch
+        run: |
+          UPSTREAM_VERSION="${{ steps.detect_upstream.outputs.latest_upstream }}"
+          UPSTREAM_SHA=$(git rev-parse refs/tags/$UPSTREAM_VERSION)
+          VERSION_BRANCH="${UPSTREAM_VERSION}-branch"
+
+          echo "Creating branch '$VERSION_BRANCH' from upstream tag"
+
+          # Create or update the branch locally using explicit ref
+          git branch -f "$VERSION_BRANCH" "$UPSTREAM_SHA"
+
+          # Push the branch using explicit ref path to avoid ambiguity
+          git push -f origin "refs/heads/$VERSION_BRANCH"
+
+          echo "upstream_version=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
+          echo "✓ Upstream version branch '$VERSION_BRANCH' created and pushed"
+
+      - name: Create summary for new upstream release
+        if: steps.detect_upstream.outputs.needs_version_branch == 'true'
+        run: |
+          echo "## 🆕 New Upstream Release Detected" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Created version branch **${{ steps.detect_upstream.outputs.latest_upstream }}** and will trigger release branch creation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+
+      # No changes
+      - name: Create summary for no new release
+        if: steps.detect_upstream.outputs.needs_version_branch == 'false'
+        run: |
+          echo "## ℹ️ No Action Needed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Latest upstream release: \`${{ steps.detect_upstream.outputs.latest_upstream }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Version branch already exists - no action needed." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "💡 **Note:** This workflow only creates version branches for new upstream releases." >> $GITHUB_STEP_SUMMARY
+          echo "To create incremental DD releases with new patches, manually trigger the create-release-branch workflow." >> $GITHUB_STEP_SUMMARY
+
+  # New version - create new ddX release
+  create-release:
+    needs: detect-releases
+    if: needs.detect-releases.outputs.needs_version_branch == 'true'
+    uses: ./.github/workflows/create-release-branch.yml
+    permissions:
+      contents: write
+      id-token: write
+    with:
+      upstream_version: ${{ needs.detect-releases.outputs.latest_upstream }}
