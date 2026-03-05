@@ -26,6 +26,7 @@ import com.google.errorprone.annotations.CheckReturnValue;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import io.grpc.Attributes;
 import io.grpc.ClientStreamTracer;
+import io.grpc.datadog.rpcteam.ManagedRetryHooks;
 import io.grpc.Compressor;
 import io.grpc.Deadline;
 import io.grpc.DecompressorRegistry;
@@ -93,6 +94,7 @@ abstract class RetriableStream<ReqT> implements ClientStream {
   private final long channelBufferLimit;
   @Nullable
   private final Throttle throttle;
+  private final ManagedRetryHooks.RetryThrottler customThrottler;
   @GuardedBy("lock")
   private final InsightBuilder closedSubstreamsInsight = new InsightBuilder();
 
@@ -121,6 +123,7 @@ abstract class RetriableStream<ReqT> implements ClientStream {
   @GuardedBy("lock")
   private FutureCanceller scheduledHedging;
   private long nextBackoffIntervalNanos;
+  private long nextCustomBackoffIntervalNanos;
   private Status cancellationStatus;
   private boolean isClosed;
 
@@ -129,7 +132,7 @@ abstract class RetriableStream<ReqT> implements ClientStream {
       ChannelBufferMeter channelBufferUsed, long perRpcBufferLimit, long channelBufferLimit,
       Executor callExecutor, ScheduledExecutorService scheduledExecutorService,
       @Nullable RetryPolicy retryPolicy, @Nullable HedgingPolicy hedgingPolicy,
-      @Nullable Throttle throttle) {
+      @Nullable Throttle throttle, ManagedRetryHooks.RetryThrottler customThrottler) {
     this.method = method;
     this.channelBufferUsed = channelBufferUsed;
     this.perRpcBufferLimit = perRpcBufferLimit;
@@ -147,6 +150,7 @@ abstract class RetriableStream<ReqT> implements ClientStream {
         "Should not provide both retryPolicy and hedgingPolicy");
     this.isHedging = hedgingPolicy != null;
     this.throttle = throttle;
+    this.customThrottler = customThrottler;
   }
 
   @SuppressWarnings("GuardedBy")  // TODO(b/145386688) this.lock==ScheduledCancellor.lock so ok
@@ -255,6 +259,7 @@ abstract class RetriableStream<ReqT> implements ClientStream {
       }
     } while (!inFlightSubStreams.compareAndSet(inFlight, inFlight + 1));
     Substream sub = new Substream(previousAttemptCount);
+    customThrottler.attemptStarted(previousAttemptCount > 0 || isTransparentRetry);
     // one tracer per substream
     final ClientStreamTracer bufferSizeTracer = new BufferSizeTracer(sub);
     ClientStreamTracer.Factory tracerFactory = new ClientStreamTracer.Factory() {
@@ -905,6 +910,7 @@ abstract class RetriableStream<ReqT> implements ClientStream {
     @Override
     public void closed(
         final Status status, final RpcProgress rpcProgress, final Metadata trailers) {
+      customThrottler.attemptCompleted(substream.previousAttemptCount > 0);
       synchronized (lock) {
         state = state.substreamClosed(substream);
         closedSubstreamsInsight.append(status.getCode());
@@ -930,7 +936,7 @@ abstract class RetriableStream<ReqT> implements ClientStream {
       if (substream.bufferLimitExceeded) {
         commitAndRun(substream);
         if (state.winningSubstream == substream) {
-          safeCloseMasterListener(status, rpcProgress, trailers);
+          safeCloseMasterListener(ManagedRetryHooks.handleError(status), rpcProgress, trailers);
         }
         return;
       }
@@ -1050,7 +1056,7 @@ abstract class RetriableStream<ReqT> implements ClientStream {
 
       commitAndRun(substream);
       if (state.winningSubstream == substream) {
-        safeCloseMasterListener(status, rpcProgress, trailers);
+        safeCloseMasterListener(ManagedRetryHooks.handleError(status), rpcProgress, trailers);
       }
     }
 
@@ -1060,35 +1066,58 @@ abstract class RetriableStream<ReqT> implements ClientStream {
      * caller should check it separately. It also updates the throttle. It does not change state.
      */
     private RetryPlan makeRetryDecision(Status status, Metadata trailer) {
-      if (retryPolicy == null) {
+      // Query the custom hook first so NO_RETRY can veto the standard policy.
+      ManagedRetryHooks.HookResult hookResult =
+          ManagedRetryHooks.queryCustomRetry(status, trailer);
+      if (hookResult.denied) {
         return new RetryPlan(false, 0);
       }
+
       boolean shouldRetry = false;
       long backoffNanos = 0L;
-      boolean isRetryableStatusCode = retryPolicy.retryableStatusCodes.contains(status.getCode());
-      Integer pushbackMillis = getPushbackMills(trailer);
-      boolean isThrottled = false;
-      if (throttle != null) {
-        if (isRetryableStatusCode || (pushbackMillis != null && pushbackMillis < 0)) {
-          isThrottled = !throttle.onQualifiedFailureThenCheckIsAboveThreshold();
+
+      if (retryPolicy != null) {
+        boolean isRetryableStatusCode = retryPolicy.retryableStatusCodes.contains(status.getCode());
+        Integer pushbackMillis = getPushbackMills(trailer);
+        boolean isThrottled = false;
+        if (throttle != null) {
+          if (isRetryableStatusCode || (pushbackMillis != null && pushbackMillis < 0)) {
+            isThrottled = !throttle.onQualifiedFailureThenCheckIsAboveThreshold();
+          }
         }
+
+        if (retryPolicy.maxAttempts > substream.previousAttemptCount + 1 && !isThrottled) {
+          if (pushbackMillis == null) {
+            if (isRetryableStatusCode) {
+              shouldRetry = true;
+              backoffNanos = intervalWithJitter(nextBackoffIntervalNanos);
+              nextBackoffIntervalNanos = Math.min(
+                  (long) (nextBackoffIntervalNanos * retryPolicy.backoffMultiplier),
+                  retryPolicy.maxBackoffNanos);
+            } // else no retry
+          } else if (pushbackMillis >= 0) {
+            shouldRetry = true;
+            backoffNanos = TimeUnit.MILLISECONDS.toNanos(pushbackMillis);
+            nextBackoffIntervalNanos = retryPolicy.initialBackoffNanos;
+          } // else no retry
+        } // else no retry
       }
 
-      if (retryPolicy.maxAttempts > substream.previousAttemptCount + 1 && !isThrottled) {
-        if (pushbackMillis == null) {
-          if (isRetryableStatusCode) {
-            shouldRetry = true;
-            backoffNanos = intervalWithJitter(nextBackoffIntervalNanos);
-            nextBackoffIntervalNanos = Math.min(
-                (long) (nextBackoffIntervalNanos * retryPolicy.backoffMultiplier),
-                retryPolicy.maxBackoffNanos);
-          } // else no retry
-        } else if (pushbackMillis >= 0) {
+        if (!shouldRetry) {
+        ManagedRetryHooks.CustomRetryPolicy customPolicy = hookResult.retryPolicy;
+        if (customPolicy != null
+            && customPolicy.maxAttempts > substream.previousAttemptCount + 1
+            && !customThrottler.throttle()) {
+          if (nextCustomBackoffIntervalNanos == 0) {
+            nextCustomBackoffIntervalNanos = customPolicy.initialBackoffNanos;
+          }
           shouldRetry = true;
-          backoffNanos = TimeUnit.MILLISECONDS.toNanos(pushbackMillis);
-          nextBackoffIntervalNanos = retryPolicy.initialBackoffNanos;
-        } // else no retry
-      } // else no retry
+          backoffNanos = intervalWithJitter(nextCustomBackoffIntervalNanos);
+          nextCustomBackoffIntervalNanos = Math.min(
+              (long) (nextCustomBackoffIntervalNanos * customPolicy.backoffMultiplier),
+              customPolicy.maxBackoffNanos);
+        }
+      }
 
       return new RetryPlan(shouldRetry, backoffNanos);
     }

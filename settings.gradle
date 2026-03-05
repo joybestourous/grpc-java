@@ -57,6 +57,8 @@ pluginManagement {
 }
 
 rootProject.name = "grpc"
+include ":grpc-datadog-rpcteam"
+project(':grpc-datadog-rpcteam').projectDir = "$rootDir/datadog/rpcteam" as File
 include ":grpc-api"
 include ":grpc-core"
 include ":grpc-context"

@@ -92,6 +92,7 @@ import io.grpc.internal.ManagedChannelImplBuilder.ClientTransportFactoryBuilder;
 import io.grpc.internal.ManagedChannelImplBuilder.FixedPortProvider;
 import io.grpc.internal.ManagedChannelServiceConfig.MethodInfo;
 import io.grpc.internal.ManagedChannelServiceConfig.ServiceConfigConvertedSelector;
+import io.grpc.datadog.rpcteam.ManagedRetryHooks;
 import io.grpc.internal.RetriableStream.ChannelBufferMeter;
 import io.grpc.internal.RetriableStream.Throttle;
 import java.net.URI;
@@ -496,7 +497,8 @@ final class ManagedChannelImpl extends ManagedChannel implements
                 transportFactory.getScheduledExecutorService(),
                 retryPolicy,
                 hedgingPolicy,
-                throttle);
+                throttle,
+                customRetryThrottler);
           }
 
           @Override
@@ -534,6 +536,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
 
   private final Rescheduler idleTimer;
   private final MetricRecorder metricRecorder;
+  private final ManagedRetryHooks.RetryThrottler customRetryThrottler;
 
   ManagedChannelImpl(
       ManagedChannelImplBuilder builder,
@@ -546,6 +549,7 @@ final class ManagedChannelImpl extends ManagedChannel implements
       List<ClientInterceptor> interceptors,
       final TimeProvider timeProvider) {
     this.target = checkNotNull(builder.target, "target");
+    this.customRetryThrottler = ManagedRetryHooks.newRetryThrottler(this.target);
     this.logId = InternalLogId.allocate("Channel", target);
     this.timeProvider = checkNotNull(timeProvider, "timeProvider");
     this.executorPool = checkNotNull(builder.executorPool, "executorPool");

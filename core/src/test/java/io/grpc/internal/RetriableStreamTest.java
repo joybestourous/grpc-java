@@ -48,6 +48,7 @@ import com.google.common.util.concurrent.MoreExecutors;
 import io.grpc.ClientStreamTracer;
 import io.grpc.Codec;
 import io.grpc.Compressor;
+import io.grpc.datadog.rpcteam.ManagedRetryHooks;
 import io.grpc.DecompressorRegistry;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
@@ -166,12 +167,26 @@ public class RetriableStreamTest {
         @Nullable RetryPolicy retryPolicy,
         @Nullable HedgingPolicy hedgingPolicy,
         @Nullable Throttle throttle) {
+      this(method, headers, channelBufferUsed, perRpcBufferLimit, channelBufferLimit, callExecutor,
+          scheduledExecutorService, retryPolicy, hedgingPolicy, throttle,
+          ManagedRetryHooks.NOOP_THROTTLER);
+    }
+
+    RecordedRetriableStream(MethodDescriptor<String, ?> method, Metadata headers,
+        ChannelBufferMeter channelBufferUsed, long perRpcBufferLimit, long channelBufferLimit,
+        Executor callExecutor,
+        ScheduledExecutorService scheduledExecutorService,
+        @Nullable RetryPolicy retryPolicy,
+        @Nullable HedgingPolicy hedgingPolicy,
+        @Nullable Throttle throttle,
+        ManagedRetryHooks.RetryThrottler customThrottler) {
       super(
           method, headers, channelBufferUsed, perRpcBufferLimit, channelBufferLimit, callExecutor,
           scheduledExecutorService,
           retryPolicy,
           hedgingPolicy,
-          throttle);
+          throttle,
+          customThrottler);
     }
 
     @Override
@@ -233,6 +248,185 @@ public class RetriableStreamTest {
   @After
   public void tearDown() {
     assertEquals(0, fakeClock.numPendingTasks());
+    // Reset global ManagedRetryHooks state between tests.
+    ManagedRetryHooks.adminOnlySetCustomRetryHook(null, null);
+    ManagedRetryHooks.adminOnlySetCustomRetryThrottler(null);
+    ManagedRetryHooks.adminOnlySetCustomErrorHandler(null);
+  }
+
+  // ---- ManagedRetryHooks tests ----
+
+  // Custom policy used by hook tests: initialBackoff=10s, so jittered backoff = 10s * 0.5 = 5s.
+  private static final ManagedRetryHooks.CustomRetryPolicy CUSTOM_RETRY_POLICY =
+      new ManagedRetryHooks.CustomRetryPolicy(
+          3,
+          TimeUnit.SECONDS.toNanos(10),
+          TimeUnit.SECONDS.toNanos(100),
+          2.0);
+
+  @Test
+  public void customRetryHook_retryDecisionTriggersRetry() {
+    // Hook returns RETRY for INTERNAL (not in the standard retryable set).
+    ManagedRetryHooks.adminOnlySetCustomRetryHook(
+        new ManagedRetryHooks.RetryHook() {
+          @Override
+          public ManagedRetryHooks.RetryDecision shouldRetry(Status status, Metadata trailers) {
+            return ManagedRetryHooks.RetryDecision.RETRY;
+          }
+        }, CUSTOM_RETRY_POLICY);
+
+    ClientStream mockStream1 = mock(ClientStream.class);
+    ClientStream mockStream2 = mock(ClientStream.class);
+    doReturn(mockStream1).when(retriableStreamRecorder).newSubstream(0);
+    doReturn(mockStream2).when(retriableStreamRecorder).newSubstream(1);
+
+    retriableStream.start(masterListener);
+    ArgumentCaptor<ClientStreamListener> listenerCaptor1 =
+        ArgumentCaptor.forClass(ClientStreamListener.class);
+    verify(mockStream1).start(listenerCaptor1.capture());
+
+    // Close with INTERNAL — not in the standard retryable set.
+    listenerCaptor1.getValue().closed(Status.INTERNAL, PROCESSED, new Metadata());
+
+    // Custom hook should have triggered a retry — a backoff task is scheduled.
+    assertEquals(1, fakeClock.numPendingTasks());
+    // initialBackoffNanos=10s, jitter factor in [0.4,1.2] → max 12s; advance 15s to be safe.
+    fakeClock.forwardTime(15, TimeUnit.SECONDS);
+    verify(retriableStreamRecorder).newSubstream(1);
+  }
+
+  @Test
+  public void customRetryHook_noRetryDecisionSuppressesStandardPolicy() {
+    // Hook returns NO_RETRY for a status that IS in the standard retryable set.
+    ManagedRetryHooks.adminOnlySetCustomRetryHook(
+        new ManagedRetryHooks.RetryHook() {
+          @Override
+          public ManagedRetryHooks.RetryDecision shouldRetry(Status status, Metadata trailers) {
+            return ManagedRetryHooks.RetryDecision.NO_RETRY;
+          }
+        }, CUSTOM_RETRY_POLICY);
+
+    ClientStream mockStream1 = mock(ClientStream.class);
+    doReturn(mockStream1).when(retriableStreamRecorder).newSubstream(0);
+
+    retriableStream.start(masterListener);
+    ArgumentCaptor<ClientStreamListener> listenerCaptor =
+        ArgumentCaptor.forClass(ClientStreamListener.class);
+    verify(mockStream1).start(listenerCaptor.capture());
+
+    // UNAVAILABLE is retryable by the standard policy — but NO_RETRY must veto it.
+    listenerCaptor.getValue().closed(Status.UNAVAILABLE, PROCESSED, new Metadata());
+
+    // No retry scheduled — stream committed immediately.
+    assertEquals(0, fakeClock.numPendingTasks());
+    verify(masterListener).closed(any(Status.class), any(RpcProgress.class), any(Metadata.class));
+  }
+
+  @Test
+  public void customRetryHook_undecidedFallsBackToStandardPolicy() {
+    // Hook returns UNDECIDED — standard retry policy should still apply.
+    ManagedRetryHooks.adminOnlySetCustomRetryHook(
+        new ManagedRetryHooks.RetryHook() {
+          @Override
+          public ManagedRetryHooks.RetryDecision shouldRetry(Status status, Metadata trailers) {
+            return ManagedRetryHooks.RetryDecision.UNDECIDED;
+          }
+        }, CUSTOM_RETRY_POLICY);
+
+    ClientStream mockStream1 = mock(ClientStream.class);
+    ClientStream mockStream2 = mock(ClientStream.class);
+    doReturn(mockStream1).when(retriableStreamRecorder).newSubstream(0);
+    doReturn(mockStream2).when(retriableStreamRecorder).newSubstream(1);
+
+    retriableStream.start(masterListener);
+    ArgumentCaptor<ClientStreamListener> listenerCaptor =
+        ArgumentCaptor.forClass(ClientStreamListener.class);
+    verify(mockStream1).start(listenerCaptor.capture());
+
+    // UNAVAILABLE is in the standard retryable set — should retry via standard policy.
+    listenerCaptor.getValue().closed(Status.UNAVAILABLE, PROCESSED, new Metadata());
+
+    assertEquals(1, fakeClock.numPendingTasks());
+    // Standard policy initialBackoff=100s, jitter factor in [0.4,1.2] → max 120s; advance 150s.
+    fakeClock.forwardTime(150, TimeUnit.SECONDS);
+    verify(retriableStreamRecorder).newSubstream(1);
+  }
+
+  @Test
+  public void customRetryThrottler_attemptLifecycleCallbacks() {
+    final List<String> calls = new ArrayList<>();
+    ManagedRetryHooks.RetryThrottler throttler = new ManagedRetryHooks.RetryThrottler() {
+      @Override public boolean throttle() { return false; }
+      @Override public void attemptStarted(boolean isRetry) { calls.add("started:" + isRetry); }
+      @Override public void attemptCompleted(boolean isRetry) { calls.add("completed:" + isRetry); }
+    };
+    ManagedRetryHooks.adminOnlySetCustomRetryHook(
+        new ManagedRetryHooks.RetryHook() {
+          @Override
+          public ManagedRetryHooks.RetryDecision shouldRetry(Status status, Metadata trailers) {
+            return ManagedRetryHooks.RetryDecision.RETRY;
+          }
+        }, CUSTOM_RETRY_POLICY);
+
+    ClientStream mockStream1 = mock(ClientStream.class);
+    ClientStream mockStream2 = mock(ClientStream.class);
+    doReturn(mockStream1).when(retriableStreamRecorder).newSubstream(0);
+    doReturn(mockStream2).when(retriableStreamRecorder).newSubstream(1);
+
+    // Use a stream with our recording throttler.
+    RetriableStream<String> stream = new RecordedRetriableStream(
+        method, new Metadata(), channelBufferUsed, PER_RPC_BUFFER_LIMIT, CHANNEL_BUFFER_LIMIT,
+        MoreExecutors.directExecutor(), fakeClock.getScheduledExecutorService(),
+        RETRY_POLICY, null, null, throttler);
+
+    stream.start(masterListener);
+    // First attempt started (isRetry=false).
+    assertEquals(Arrays.asList("started:false"), calls);
+
+    ArgumentCaptor<ClientStreamListener> listenerCaptor =
+        ArgumentCaptor.forClass(ClientStreamListener.class);
+    verify(mockStream1).start(listenerCaptor.capture());
+    listenerCaptor.getValue().closed(Status.INTERNAL, PROCESSED, new Metadata());
+
+    // First attempt completed (isRetry=false), then second attempt started (isRetry=true).
+    // Note: attemptStarted for the retry is called synchronously in createSubstream(), before the
+    // backoff task is scheduled — so these assertions pass without advancing the clock.
+    assertTrue(calls.contains("completed:false"));
+    assertTrue(calls.contains("started:true"));
+    // Drain the pending backoff task so tearDown sees 0 pending tasks.
+    fakeClock.forwardTime(15, TimeUnit.SECONDS);
+  }
+
+  @Test
+  public void customErrorHandler_transformsStatusBeforeMasterListener() {
+    ManagedRetryHooks.adminOnlySetCustomErrorHandler(
+        new ManagedRetryHooks.ErrorHandler() {
+          @Override
+          public Status handleError(Status status) {
+            return Status.UNAVAILABLE.withDescription("transformed");
+          }
+        });
+
+    ClientStream mockStream1 = mock(ClientStream.class);
+    doReturn(mockStream1).when(retriableStreamRecorder).newSubstream(0);
+
+    // Stream with no retry policy commits immediately on failure.
+    RetriableStream<String> stream = new RecordedRetriableStream(
+        method, new Metadata(), channelBufferUsed, PER_RPC_BUFFER_LIMIT, CHANNEL_BUFFER_LIMIT,
+        MoreExecutors.directExecutor(), fakeClock.getScheduledExecutorService(),
+        null, null, null, ManagedRetryHooks.NOOP_THROTTLER);
+
+    stream.start(masterListener);
+    ArgumentCaptor<ClientStreamListener> listenerCaptor =
+        ArgumentCaptor.forClass(ClientStreamListener.class);
+    verify(mockStream1).start(listenerCaptor.capture());
+    listenerCaptor.getValue().closed(Status.INTERNAL, PROCESSED, new Metadata());
+
+    ArgumentCaptor<Status> statusCaptor = ArgumentCaptor.forClass(Status.class);
+    verify(masterListener).closed(
+        statusCaptor.capture(), any(RpcProgress.class), any(Metadata.class));
+    assertEquals(Status.Code.UNAVAILABLE, statusCaptor.getValue().getCode());
+    assertEquals("transformed", statusCaptor.getValue().getDescription());
   }
 
   @Test

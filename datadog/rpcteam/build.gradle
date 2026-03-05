@@ -1,0 +1,9 @@
+plugins {
+    id "java-library"
+}
+
+description = 'gRPC: Datadog RPC Team hooks'
+
+dependencies {
+    api project(':grpc-api')
+}
