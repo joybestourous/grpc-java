@@ -1,0 +1,291 @@
+name: Sync dd-master with Upstream
+
+env:
+  GIT_AUTHOR_NAME: "sync-dd-master[bot]"
+  GIT_AUTHOR_EMAIL: "sync-dd-master[bot]@datadoghq.com"
+
+on:
+  schedule:
+    # Run weekly on Mondays at 7:00 UTC
+    - cron: '0 7 * * 1'
+  workflow_dispatch: # Allow manual triggering
+
+permissions:
+  actions: write   # Required to trigger create-release-branch workflow
+  contents: write  # Required to force push branches and tags
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      id-token: write # Needed to federate tokens.
+
+    steps:
+      # Setup
+      - uses: DataDog/dd-octo-sts-action@acaa02eee7e3bb0839e4272dacb37b8f3b58ba80 # v1.0.3
+        id: octo-sts
+        with:
+          scope: DataDog/grpc-java-private
+          policy: self.sync-dd-master
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.octo-sts.outputs.token }}
+      - name: Configure Git
+        run: |
+          git config user.name "${GIT_AUTHOR_NAME}"
+          git config user.email "${GIT_AUTHOR_EMAIL}"
+
+          if ! git remote | grep -q "^upstream$"; then
+            git remote add upstream https://github.com/grpc/grpc-java.git
+          fi
+
+          git fetch upstream --tags
+          git fetch origin dd-master
+
+      - name: Get latest upstream release
+        id: get_release
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            // Get latest upstream release from grpc/grpc-java
+            const { data: latestRelease } = await github.rest.repos.getLatestRelease({
+              owner: 'grpc',
+              repo: 'grpc-java'
+            });
+
+            const latestTag = latestRelease.tag_name;
+            console.log(`Latest upstream release: ${latestTag}`);
+            core.setOutput('latest_release', latestTag);
+
+      - name: Fetch latest release tag
+        run: |
+          LATEST_RELEASE="${{ steps.get_release.outputs.latest_release }}"
+          echo "Latest upstream release: $LATEST_RELEASE"
+          git fetch upstream tag $LATEST_RELEASE
+
+      - name: Check if update is needed
+        id: check
+        run: |
+          LATEST_RELEASE="${{ steps.get_release.outputs.latest_release }}"
+
+          # Compare latest release with origin/dd-master base
+          # Find the merge base between dd-master and the latest release
+          MERGE_BASE=$(git merge-base origin/dd-master $LATEST_RELEASE)
+          RELEASE_SHA=$(git rev-parse $LATEST_RELEASE)
+
+          if [ "$MERGE_BASE" = "$RELEASE_SHA" ]; then
+            echo "No update needed - dd-master is already up to date with $LATEST_RELEASE"
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          else
+            echo "Update needed - new release $LATEST_RELEASE available"
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          fi
+
+
+
+      # Update master to track upstream/master (for visibility into upcoming changes)
+      - name: Push master branch
+        if: steps.check.outputs.needs_update == 'true'
+        id: push_master
+        run: |
+          # Fetch and reset master to upstream/master
+          git fetch upstream master
+          git checkout -B master upstream/master
+          git push origin master --force
+
+          # Output SHA for commit-headless
+          echo "master_head_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Add GitHub config to master
+        if: steps.check.outputs.needs_update == 'true'
+        id: master_config_commit
+        run: |
+          # Add GitHub config from dd-master
+          git restore --source=origin/dd-master --staged --worktree -- CODEOWNERS .github/
+          git commit -m "Sync GitHub config from dd-master"
+
+          # Output commit SHA for commit-headless
+          echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Push master branch with signed commit
+        if: steps.check.outputs.needs_update == 'true'
+        uses: DataDog/commit-headless@5a0f3876e0fbdd3a86b3e008acf4ec562db59eee # action/v2.0.1
+        with:
+          token: ${{ steps.octo-sts.outputs.token }}
+          branch: master
+          head-sha: ${{ steps.push_master.outputs.master_head_sha }}
+          command: push
+          commits: "${{ steps.master_config_commit.outputs.commit }}"
+      # Attempt rebase of dd-master
+      - name: Create timestamped branch and rebase
+        if: steps.check.outputs.needs_update == 'true'
+        id: rebase
+        run: |
+          LATEST_RELEASE="${{ steps.get_release.outputs.latest_release }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          NEW_BRANCH="dd-master-${TIMESTAMP}"
+          echo "branch_name=$NEW_BRANCH" >> $GITHUB_OUTPUT
+
+          # Create new branch from dd-master
+          git checkout -b $NEW_BRANCH origin/dd-master
+
+          # Attempt rebase onto latest release
+          if git rebase $LATEST_RELEASE; then
+            echo "rebase_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "rebase_success=false" >> $GITHUB_OUTPUT
+            git rebase --abort
+            echo "Rebase conflict detected - will create PR for manual resolution"
+          fi
+
+
+      # Rebase success - update repo
+      - name: Validate patches
+        if: steps.check.outputs.needs_update == 'true' && steps.rebase.outputs.rebase_success == 'true'
+        run: |
+          LATEST_RELEASE="${{ steps.get_release.outputs.latest_release }}"
+          ./datadog/releases/validate_patches_on_top.sh ${{ steps.rebase.outputs.branch_name }} $LATEST_RELEASE
+
+      - name: Push timestamped branch for review
+        if: steps.check.outputs.needs_update == 'true' && steps.rebase.outputs.rebase_success == 'true'
+        run: |
+          NEW_BRANCH="${{ steps.rebase.outputs.branch_name }}"
+
+          # Push the timestamped branch
+          git push origin "$NEW_BRANCH"
+
+      - name: Create PR for review
+        if: steps.check.outputs.needs_update == 'true' && steps.rebase.outputs.rebase_success == 'true'
+        env:
+          GH_TOKEN: ${{ steps.octo-sts.outputs.token }}
+        run: |
+          NEW_BRANCH="${{ steps.rebase.outputs.branch_name }}"
+          LATEST_RELEASE="${{ steps.get_release.outputs.latest_release }}"
+
+          # Generate range-diff
+          RANGE_DIFF=$(git range-diff $LATEST_RELEASE..origin/dd-master $LATEST_RELEASE.."$NEW_BRANCH" || echo "Unable to generate range-diff")
+
+          # Create PR with latest release as base (for easier review)
+          gh pr create \
+            --repo DataDog/grpc-java-private \
+            --base $LATEST_RELEASE-branch \
+            --head "$NEW_BRANCH" \
+            --title "Sync dd-master with latest upstream release ($LATEST_RELEASE)" \
+            --body "## ✅ [dd-master] Automatic Rebase Successful
+
+          Successfully rebased dd-master onto the latest upstream release **$LATEST_RELEASE**.
+
+          This PR was automatically created for review.
+          The base branch is \`$LATEST_RELEASE-branch\` to make it easier to review DataDog patches.
+
+          ### Manual Steps After PR Approval:
+
+          After reviewing and approving this PR, update dd-master with:
+
+          \`\`\`bash
+          git fetch origin $NEW_BRANCH
+          git checkout dd-master
+          git reset --hard origin/$NEW_BRANCH
+          git push origin dd-master --force
+          git push origin --delete $NEW_BRANCH
+          git branch -d $NEW_BRANCH
+          \`\`\`
+
+          **Note:** dd-master tracks the latest stable upstream release instead of upstream/master.
+          This ensures all DataDog patches are compatible with released versions.
+
+          ## Range-diff between previous patches and new patches
+          \`\`\`
+          $RANGE_DIFF
+          \`\`\`"
+
+          # Output summary
+          echo "## ✅ Sync Successful - PR Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Successfully rebased dd-master onto latest release $LATEST_RELEASE." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "A PR has been created for review: [View PR](https://github.com/DataDog/grpc-java-private/pulls)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Branch: \`$NEW_BRANCH\`" >> $GITHUB_STEP_SUMMARY
+
+      # Rebase failure
+      - name: Push conflict branch
+        if: steps.check.outputs.needs_update == 'true' && steps.rebase.outputs.rebase_success == 'false'
+        run: |
+          NEW_BRANCH="${{ steps.rebase.outputs.branch_name }}"
+
+          # Push the timestamped branch (before conflict)
+          git push origin "$NEW_BRANCH"
+
+      - name: Create PR for conflict resolution
+        if: steps.check.outputs.needs_update == 'true' && steps.rebase.outputs.rebase_success == 'false'
+        env:
+          GH_TOKEN: ${{ steps.octo-sts.outputs.token }}
+        run: |
+          NEW_BRANCH="${{ steps.rebase.outputs.branch_name }}"
+          LATEST_RELEASE="${{ steps.get_release.outputs.latest_release }}"
+
+          # Generate range-diff
+          RANGE_DIFF=$(git range-diff $LATEST_RELEASE..origin/dd-master $LATEST_RELEASE.."$NEW_BRANCH" || echo "Unable to generate range-diff")
+
+          # Create PR
+          gh pr create \
+            --repo DataDog/grpc-java-private \
+            --base $LATEST_RELEASE-branch \
+            --head "$NEW_BRANCH" \
+            --title "Review dd-master changes (conflict resolution needed for $LATEST_RELEASE)" \
+            --body "## ⚠️ [dd-master] Rebase Conflict Detected
+
+          The automated sync failed due to conflicts when rebasing dd-master onto latest release **$LATEST_RELEASE**.
+
+          This PR was automatically created for manual conflict resolution.
+          It contains our patches from dd-master that need to be rebased onto $LATEST_RELEASE.
+
+          ### Manual Resolution Steps:
+
+          1. Checkout the branch locally:
+          \`\`\`bash
+          git fetch origin $NEW_BRANCH
+          git checkout $NEW_BRANCH
+          \`\`\`
+
+          2. Rebase onto the latest release and resolve conflicts:
+          \`\`\`bash
+          git fetch upstream tag $LATEST_RELEASE
+          git rebase $LATEST_RELEASE
+          # Resolve conflicts in your editor
+          git add <resolved-files>
+          git rebase --continue
+          \`\`\`
+
+          3. Push the resolved changes:
+          \`\`\`bash
+          git push origin $NEW_BRANCH --force
+          \`\`\`
+
+          4. After PR approval, force push to dd-master:
+          \`\`\`bash
+          git checkout dd-master
+          git reset --hard $NEW_BRANCH
+          git push origin dd-master --force
+          git push origin --delete $NEW_BRANCH
+          git branch -d $NEW_BRANCH
+          \`\`\`
+
+          **Note:** dd-master tracks the latest stable upstream release instead of upstream/master.
+
+          ## Range-diff between previous patches and new patches
+          \`\`\`
+          $RANGE_DIFF
+          \`\`\`"
+
+          # Output conflict summary
+          echo "## ⚠️ Rebase Conflict Detected" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "A PR has been created for manual conflict resolution: [View PR](https://github.com/DataDog/grpc-java-private/pulls)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Branch: \`$NEW_BRANCH\`" >> $GITHUB_STEP_SUMMARY
+          echo "Target release: \`$LATEST_RELEASE\`" >> $GITHUB_STEP_SUMMARY

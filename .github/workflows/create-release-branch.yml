@@ -1,0 +1,241 @@
+name: Create Release Branch
+
+env:
+  GIT_AUTHOR_NAME: "create-release-branch[bot]"
+  GIT_AUTHOR_EMAIL: "create-release-branch[bot]@datadoghq.com"
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_version:
+        description: 'Upstream version tag (e.g., v1.68.0)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      upstream_version:
+        description: 'Upstream version tag (e.g., v1.68.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: create-release-${{ inputs.upstream_version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # Required to push branches and tags
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      id-token: write # Needed to federate tokens.
+    outputs:
+      rebase_success: ${{ steps.rebase.outputs.rebase_success }}
+      tag_name: ${{ steps.create_branch.outputs.tag_name }}
+
+    steps:
+      # Setup
+      - uses: DataDog/dd-octo-sts-action@acaa02eee7e3bb0839e4272dacb37b8f3b58ba80 # v1.0.3
+        id: octo-sts
+        with:
+          scope: DataDog/grpc-java-private
+          policy: self.create-release-branch
+
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          token: ${{ steps.octo-sts.outputs.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "${GIT_AUTHOR_NAME}"
+          git config user.email "${GIT_AUTHOR_EMAIL}"
+
+          if ! git remote | grep -q "^upstream$"; then
+            git remote add upstream https://github.com/grpc/grpc-java.git
+          fi
+
+      - name: Fetch upstream tag, master, and dd-master
+        run: |
+          # Fetch upstream tag (will fail if tag doesn't exist)
+          if ! git fetch upstream refs/tags/${{ inputs.upstream_version }}:refs/tags/${{ inputs.upstream_version }}; then
+            echo "Error: Upstream version tag '${{ inputs.upstream_version }}' not found in grpc/grpc-java"
+            exit 1
+          fi
+
+          git fetch upstream master
+          git fetch origin dd-master
+
+
+      # Attempt rebase of patches to release branch
+      - name: Find next dd number
+        id: create_branch
+        run: |
+          RELEASE_TAG="${{ inputs.upstream_version }}"
+          VERSION="${RELEASE_TAG#v}"
+          UPSTREAM_SHA=$(git rev-parse refs/tags/${{ inputs.upstream_version }})
+
+          # Find the next available dd number by checking remote branches
+          DD_NUM=1
+          while git show-ref --verify --quiet refs/remotes/origin/$RELEASE_TAG-dd$DD_NUM-branch; do
+            DD_NUM=$((DD_NUM + 1))
+          done
+
+          NEW_BRANCH="$RELEASE_TAG-dd$DD_NUM-branch"
+          NEW_TAG="$RELEASE_TAG-dd$DD_NUM"
+
+          echo "branch_name=$NEW_BRANCH" >> $GITHUB_OUTPUT
+          echo "tag_name=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION-dd$DD_NUM" >> $GITHUB_OUTPUT
+
+          # Create new branch from upstream release SHA (avoids ambiguity)
+          git checkout -b $NEW_BRANCH $UPSTREAM_SHA
+
+      - name: Rebase patches onto release branch
+        id: rebase
+        run: |
+          NEW_BRANCH="${{ steps.create_branch.outputs.branch_name }}"
+
+          # Rebase patches from dd-master onto the release tag
+          # Using --onto to rebase commits between upstream/master and dd-master onto the new branch
+          # The merge-base will be the release tag that dd-master is based on, so only DataDog patches are rebased
+          # Using git rev-parse to avoid modifying the dd-master branch directly
+          if git rebase --onto $NEW_BRANCH upstream/master $(git rev-parse origin/dd-master); then
+            # The rebase leaves us in detached HEAD with the rebased commits
+            # Update the branch pointer to the current HEAD
+            git checkout -B $NEW_BRANCH HEAD
+            echo "rebase_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "rebase_success=false" >> $GITHUB_OUTPUT
+            git rebase --abort
+            echo "Rebase conflict detected - will create PR for manual resolution"
+          fi
+
+
+      # Rebase success - create release branch
+      - name: Validate patches
+        if: steps.rebase.outputs.rebase_success == 'true'
+        run: |
+          ./datadog/releases/validate_patches_on_top.sh ${{ steps.create_branch.outputs.branch_name }} ${{ inputs.upstream_version }}
+
+      - name: Push rebased branch
+        if: steps.rebase.outputs.rebase_success == 'true'
+        id: push_rebase
+        run: |
+          NEW_BRANCH="${{ steps.create_branch.outputs.branch_name }}"
+
+          # Push the rebased branch to establish remote HEAD
+          git push origin "$NEW_BRANCH"
+
+      - name: Update version in build.gradle and create commit
+        if: steps.rebase.outputs.rebase_success == 'true'
+        id: create_version_commit
+        run: |
+          NEW_BRANCH="${{ steps.create_branch.outputs.branch_name }}"
+          VERSION="${{ steps.create_branch.outputs.version }}"
+
+          # Update version in build.gradle directly (without using script to avoid premature push)
+          if [[ "$(uname)" == "Darwin" ]]; then
+            sed -i '' "s/version = \"[^\"]*\" \/\/ CURRENT_GRPC_VERSION/version = \"${VERSION}\" \/\/ CURRENT_GRPC_VERSION/" build.gradle
+          else
+            sed -i "s/version = \"[^\"]*\" \/\/ CURRENT_GRPC_VERSION/version = \"${VERSION}\" \/\/ CURRENT_GRPC_VERSION/" build.gradle
+          fi
+          git add build.gradle
+          git commit -m "Update build.gradle to ${VERSION}"
+
+          # Output commit SHAs for commit-headless
+          echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Push release branch with signed commits
+        if: steps.rebase.outputs.rebase_success == 'true'
+        uses: DataDog/commit-headless@5a0f3876e0fbdd3a86b3e008acf4ec562db59eee # action/v2.0.1
+        with:
+          token: ${{ steps.octo-sts.outputs.token }}
+          branch: ${{ steps.create_branch.outputs.branch_name }}
+          command: push
+          commits: "${{ steps.create_version_commit.outputs.commit }}"
+
+      - name: Create and push tag
+        if: steps.rebase.outputs.rebase_success == 'true'
+        run: |
+          TAG_NAME="${{ steps.create_branch.outputs.tag_name }}"
+
+          # Create annotated tag
+          git tag -a "$TAG_NAME" -m "Version $TAG_NAME release"
+
+          # Push the tag explicitly (branch and tag have the same name without -branch suffix)
+          git push origin "refs/tags/$TAG_NAME"
+
+      - name: Create summary
+        if: steps.rebase.outputs.rebase_success == 'true'
+        run: |
+          cat <<-EOF >> "$GITHUB_STEP_SUMMARY"
+          ## ✅ Release Branch Created Successfully
+          Branch and tag have been created and pushed to origin.
+
+          **Branch:** `${{ steps.create_branch.outputs.branch_name }}`
+          **Tag:** `${{ steps.create_branch.outputs.tag_name }}`
+          **Version:** `${{ steps.create_branch.outputs.version }}`
+          **Base:** `${{ inputs.upstream_version }}`
+
+          ### Next Steps
+
+          Update downstream Java projects to use the new version tag in their dependency declarations.
+
+          ### DataDog Patches Applied
+          \`\`\`
+          git log --oneline ${{ inputs.upstream_version }}..${{ steps.create_branch.outputs.branch_name }}
+          \`\`\`
+
+          EOF
+
+      # Rebase failure
+      - name: Print conflict resolution instructions
+        if: steps.rebase.outputs.rebase_success == 'false'
+        run: |
+          NEW_BRANCH="${{ steps.create_branch.outputs.branch_name }}"
+          UPSTREAM_VERSION="${{ inputs.upstream_version }}"
+          VERSION_BRANCH="${UPSTREAM_VERSION}-branch"
+
+          cat <<-EOF >> "$GITHUB_STEP_SUMMARY"
+          ## ⚠️ Rebase Conflict Detected
+
+          Failed to automatically rebase DataDog patches from \`dd-master\` onto upstream \`$UPSTREAM_VERSION\` and
+          requires manual resolution.
+
+          ### Manual Resolution Steps:
+
+          1. Checkout the version branch and ensure it's up to date:
+          \`\`\`bash
+          git fetch upstream tag $UPSTREAM_VERSION
+          git branch -f $VERSION_BRANCH $UPSTREAM_VERSION
+          git push --force origin $VERSION_BRANCH
+          \`\`\`
+
+          2. Rebase datadog patches on top of the version branch:
+          \`\`\`bash
+          git checkout $NEW_BRANCH
+          git rebase --onto $VERSION_BRANCH upstream/master origin/dd-master
+          # Resolve conflicts in your editor
+          git add <resolved-files>
+          git rebase --continue
+          git push origin $NEW_BRANCH --force
+          \`\`\`
+
+          3. Update build.gradle version:
+          \`\`\`bash
+          ./datadog/releases/complete_rebase_update.sh $NEW_BRANCH $UPSTREAM_VERSION
+          \`\`\`
+
+          4. Complete release:
+          \`\`\`bash
+          git tag -a ${{ steps.create_branch.outputs.tag_name }} -m 'Version ${{ steps.create_branch.outputs.tag_name }} release'
+          git push origin ${{ steps.create_branch.outputs.tag_name }}
+          \`\`\`
+
+          EOF
+
+          exit 1
